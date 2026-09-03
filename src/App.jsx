@@ -1,10 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { supabase } from './supabaseClient.js';
+import { supabase, configOk } from './supabaseClient.js';
 import MonthGrid from './components/MonthGrid.jsx';
 import DaySheet from './components/DaySheet.jsx';
 import StaffPanel from './components/StaffPanel.jsx';
 import { ChevronLeft, ChevronRight, Users, LogOut, CalendarIcon } from './components/Icons.jsx';
 import { monthLabel, monthRange } from './utils.js';
+import {
+  enablePush,
+  isIosSafariNotInstalled,
+  pushPermission,
+  pushSupported,
+  registerServiceWorker,
+  sendPush,
+} from './push.js';
 
 /* ------------------------------------------------------------------ */
 /* Sign in                                                             */
@@ -68,6 +76,26 @@ function SignIn() {
   );
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Setup notice — shown when the environment variables are missing      */
+/* ------------------------------------------------------------------ */
+
+function SetupNotice() {
+  return (
+    <div className="signin-wrap">
+      <div className="signin">
+        <h1>Not connected yet</h1>
+        <p>
+          This app cannot reach its database. In Vercel, open Settings then
+          Environment Variables and add VITE_SUPABASE_URL and
+          VITE_SUPABASE_ANON_KEY, then redeploy.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* App                                                                 */
 /* ------------------------------------------------------------------ */
@@ -88,16 +116,32 @@ export default function App() {
   const [showStaff, setShowStaff] = useState(false);
   const [saving, setSaving] = useState(false);
   const [loadError, setLoadError] = useState('');
+  const [pushState, setPushState] = useState('default');
+  const [notice, setNotice] = useState('');
 
   /* ---------- session ---------- */
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
+    if (!configOk) {
       setReady(true);
-    });
+      return;
+    }
+    let cancelled = false;
+    supabase.auth
+      .getSession()
+      .then(({ data }) => {
+        if (cancelled) return;
+        setSession(data.session);
+        setReady(true);
+      })
+      .catch(() => {
+        if (!cancelled) setReady(true);
+      });
     const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
-    return () => sub.subscription.unsubscribe();
+    return () => {
+      cancelled = true;
+      sub.subscription.unsubscribe();
+    };
   }, []);
 
   /* ---------- who am I, stores, people ---------- */
@@ -122,6 +166,28 @@ export default function App() {
   useEffect(() => {
     loadCore();
   }, [loadCore]);
+
+  /* ---------- notifications ---------- */
+
+  useEffect(() => {
+    if (!session) return;
+    setPushState(pushPermission());
+    registerServiceWorker();
+  }, [session]);
+
+  async function turnOnNotifications() {
+    const result = await enablePush(session.user.id);
+    setPushState(pushPermission());
+    if (result.ok) {
+      setNotice('Notifications are on for this device.');
+    } else if (result.reason === 'denied') {
+      setNotice('Your browser is blocking notifications. Turn them back on in site settings.');
+    } else if (result.reason === 'unsupported') {
+      setNotice('This browser cannot receive notifications.');
+    } else {
+      setNotice('Notifications could not be turned on. Try again.');
+    }
+  }
 
   /* ---------- shifts for the visible month ---------- */
 
@@ -206,7 +272,27 @@ export default function App() {
     setSaving(false);
     if (error) return false;
     await loadShifts();
+
+    // Tell the pharmacist their own shift changed.
+    if (shift.pharmacist_id) {
+      const loc = locationsById[shift.location_id];
+      sendPush({
+        userIds: [shift.pharmacist_id],
+        title: shift.id ? 'Your shift changed' : 'New shift assigned',
+        body: `${loc ? loc.name : 'A store'} on ${shift.shift_date}, ${shift.start_time}–${shift.end_time}`,
+      });
+    }
     return true;
+  }
+
+  // Manager announces that the month is set.
+  async function publishMonth() {
+    const ok = await sendPush({
+      userIds: null,
+      title: 'Schedule posted',
+      body: `The ${monthLabel(viewDate)} schedule is up. Open the app to see your shifts.`,
+    });
+    setNotice(ok ? 'Everyone with notifications on has been told.' : 'The notification could not be sent.');
   }
 
   async function deleteShift(id) {
@@ -230,7 +316,10 @@ export default function App() {
 
   /* ---------- render ---------- */
 
-  if (!ready) return null;
+  if (!configOk) return <SetupNotice />;
+  if (!ready) {
+    return <div className="app"><p className="empty">Loading…</p></div>;
+  }
   if (!session) return <SignIn />;
 
   return (
@@ -305,6 +394,35 @@ export default function App() {
       </div>
 
       {loadError && <div className="error" style={{ marginBottom: 10 }}>{loadError}</div>}
+
+      {notice && (
+        <div
+          className="form-card"
+          style={{ marginBottom: 10, fontSize: 13, display: 'flex', gap: 10, alignItems: 'center' }}
+        >
+          <span style={{ flex: 1 }}>{notice}</span>
+          <button className="chip-btn" onClick={() => setNotice('')}>Dismiss</button>
+        </div>
+      )}
+
+      {pushSupported() && pushState === 'default' && (
+        <div className="form-card" style={{ marginBottom: 10, fontSize: 13 }}>
+          <div style={{ marginBottom: 8 }}>
+            Get a notification when your shifts change.
+            {isIosSafariNotInstalled() &&
+              ' On iPhone, first tap Share and Add to Home Screen, then open it from there.'}
+          </div>
+          <button className="btn ghost" onClick={turnOnNotifications}>
+            Turn on notifications
+          </button>
+        </div>
+      )}
+
+      {isManager && (
+        <button className="btn ghost" style={{ marginBottom: 10 }} onClick={publishMonth}>
+          Post {monthLabel(viewDate)} and notify everyone
+        </button>
+      )}
 
       <MonthGrid
         viewDate={viewDate}
